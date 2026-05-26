@@ -4,7 +4,7 @@
 
 import { WeixinApi } from "./api.js";
 import { loadSyncState, updateSyncBuf } from "./storage.js";
-import type { WeixinAccount, WeixinMessage } from "./types.js";
+import type { WeixinAccount, WeixinMessage, ImageItem } from "./types.js";
 import { MessageItemType } from "./types.js";
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -13,6 +13,7 @@ export type MessageCallback = (
   account: WeixinAccount,
   msg: WeixinMessage,
   text: string,
+  imageItem?: ImageItem,
 ) => void;
 
 export type LogCallback = (msg: string) => void;
@@ -126,8 +127,11 @@ export class Poller {
             if (msg.message_type === 2) continue;
 
             const text = extractText(msg);
-            if (text) {
-              this.onMessage(this.account, msg, text);
+            const imageItem = extractImage(msg);
+
+            // Deliver if there is text or an image (or both)
+            if (text || imageItem) {
+              this.onMessage(this.account, msg, text || "", imageItem);
             }
           }
         }
@@ -167,6 +171,17 @@ function extractText(msg: WeixinMessage): string | null {
     }
   }
   return null;
+}
+
+/** Extract the first image item from a Weixin message's item list. */
+function extractImage(msg: WeixinMessage): ImageItem | undefined {
+  if (!msg.item_list || msg.item_list.length === 0) return undefined;
+  for (const item of msg.item_list) {
+    if (item.type === MessageItemType.IMAGE && item.image_item) {
+      return item.image_item;
+    }
+  }
+  return undefined;
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {

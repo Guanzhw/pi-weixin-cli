@@ -1,9 +1,18 @@
 {
   "name": "pi-weixin-cli",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "type": "module",
-  "description": "Weixin (WeChat) integration for pi - receive and reply to WeChat messages from your terminal",
+  "description": "Weixin (WeChat) integration for pi - receive and reply to WeChat messages via RPC",
+  "bin": {
+    "pi-weixin-cli": "dist/main.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "postbuild": "chmod +x dist/main.js",
+    "prepack": "npm run build",
+    "start": "node dist/main.js"
+  },
   "dependencies": {
     "qrcode-terminal": "^0.12.0"
   },
