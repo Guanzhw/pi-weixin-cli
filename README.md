@@ -12,16 +12,13 @@ pi-weixin-cli 是一个**独立可执行程序**，通过 spawn `pi --mode rpc` 
 
 ## 安装
 
-### 方式一：npm link（推荐，一次安装全局使用）
+### 方式一：npm 全局安装（推荐，最简单）
 
 ```bash
-cd ~/.pi/agent/extensions/pi-weixin-cli
-npm install
-npm run build
-npm link
+npm install -g pi-weixin-cli
 ```
 
-安装后即可在任何目录直接使用 `pi-weixin-cli` 命令：
+安装后即可在任何目录直接使用：
 
 ```bash
 pi-weixin-cli --help
@@ -30,28 +27,27 @@ pi-weixin-cli status
 pi-weixin-cli          # 启动 daemon
 ```
 
-### 方式二：npx（无需安装，每次编译后执行）
+升级：
+```bash
+npm update -g pi-weixin-cli
+```
+
+### 方式二：从源码安装（开发或自定义）
 
 ```bash
-cd ~/.pi/agent/extensions/pi-weixin-cli
+git clone https://github.com/Guanzhw/pi-weixin-cli.git
+cd pi-weixin-cli
 npm install
 npm run build
+npm link
+```
 
-# 通过 npx 运行
+### 方式三：npx 直接运行（无需安装）
+
+```bash
 npx pi-weixin-cli login
 npx pi-weixin-cli status
 npx pi-weixin-cli      # 启动 daemon
-```
-
-### 方式三：本地直接执行
-
-```bash
-cd ~/.pi/agent/extensions/pi-weixin-cli
-npm install
-npm run build
-
-./dist/main.js login
-./dist/main.js
 ```
 
 ## 快速开始
@@ -69,10 +65,16 @@ pi-weixin-cli daemon
 
 启动后，脚本会自动 spawn `pi --mode rpc` 子进程，并通过 JSONL 协议维持通信。当有微信消息到达时转发给 Pi，Pi 的回复自动发送回微信。
 
-### 升级/重新安装
+### 升级
 
+**从 npm 全局安装：**
 ```bash
-cd ~/.pi/agent/extensions/pi-weixin-cli
+npm update -g pi-weixin-cli
+```
+
+**从源码安装：**
+```bash
+cd pi-weixin-cli
 git pull              # 更新代码
 npm install           # 更新依赖
 npm run build         # 重新编译
