@@ -15,6 +15,7 @@ import type {
   QueuedWeixinMessage,
 } from "./types.js";
 import { MessageItemType, MessageType, MessageState } from "./types.js";
+import type { WeixinConfig } from "./config.js";
 import crypto from "node:crypto";
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -40,6 +41,12 @@ export class WeixinBridge {
   private readonly api: WeixinApi;
   private readonly log?: LogCallback;
 
+  /** Counter tracking how many WeChat messages have been injected this session. */
+  private messageCount = 0;
+
+  /** Current hint configuration (mutable, updated by /weixin-config). */
+  private config: WeixinConfig;
+
   /** Queue of messages waiting to be injected into Pi. */
   private readonly messageQueue: QueuedWeixinMessage[] = [];
 
@@ -60,9 +67,10 @@ export class WeixinBridge {
   /** Whether the bridge is accepting new messages. */
   private _enabled = true;
 
-  constructor(pi: PiAPI, api: WeixinApi, log?: LogCallback) {
+  constructor(pi: PiAPI, api: WeixinApi, config: WeixinConfig, log?: LogCallback) {
     this.pi = pi;
     this.api = api;
+    this.config = config;
     this.log = log;
   }
 
@@ -156,6 +164,58 @@ export class WeixinBridge {
     this.flushQueue();
   }
 
+  /**
+   * Send a plain text notification to the current WeChat user.
+   * Unlike handleAgentEnd, this does NOT clear pendingContext or mark
+   * the WeChat turn as complete — it's used for mid-turn notifications
+   * such as ask_user prompts.
+   */
+  public async sendTextReply(text: string): Promise<void> {
+    if (!this.pendingContext) return;
+    const ctx = this.pendingContext;
+    await this.sendReply(ctx.account, ctx.userId, ctx.contextToken, ctx.sessionId, text);
+  }
+
+  /**
+   * Notify the current WeChat user that Pi is asking a question via ask_user.
+   * Used when the user is interacting via WeChat and can't see Pi's TUI.
+   */
+  async notifyAskUser(
+    question: string,
+    options?: Array<string | { title: string; description?: string }>,
+  ): Promise<void> {
+    if (!this.pendingContext) return;
+
+    let notifyText = `Pi 在问你：${question}`;
+    if (options && options.length > 0) {
+      notifyText += "\n\n请选择：";
+      options.forEach((opt, i) => {
+        const title = typeof opt === "string" ? opt : opt.title;
+        notifyText += `\n${i + 1}. ${title}`;
+      });
+      notifyText += "\n\n请回复选项编号，或在 Pi 终端中直接操作。";
+    } else {
+      notifyText += "\n\n请直接在 Pi 终端中回复。";
+    }
+
+    await this.sendTextReply(notifyText);
+  }
+
+  /** Reset the per-session WeChat message counter (called on session_start). */
+  public resetMessageCount(): void {
+    this.messageCount = 0;
+  }
+
+  /** Get the current message counter value (for status display). */
+  public getMessageCount(): number {
+    return this.messageCount;
+  }
+
+  /** Update hint configuration at runtime (no /reload needed). */
+  public updateConfig(newConfig: WeixinConfig): void {
+    this.config = newConfig;
+  }
+
   // ── Private ──────────────────────────────────────────────────────────
 
   /**
@@ -173,15 +233,26 @@ export class WeixinBridge {
     this.processingWeixin = true;
     this.pendingContext = { account, userId, contextToken, sessionId };
 
+    // Optionally append a TUI-disable hint at the configured interval
+    let messageText = text;
+    if (this.config.hintsEnabled) {
+      const shouldHint = this.messageCount % this.config.hintInterval === 0;
+      if (shouldHint) {
+        messageText = `${text}\n\n${this.config.hintMessage}`;
+        this.log?.(`[weixin] 已附加 TUI 禁用提示 (第 ${this.messageCount + 1} 条)`);
+      }
+      this.messageCount++;
+    }
+
     try {
-      this.pi.sendUserMessage(text);
+      this.pi.sendUserMessage(messageText);
       this.log?.(`[weixin] 已注入 Pi session`);
       return;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("already processing") || msg.includes("streamingBehavior") || msg.includes("steer")) {
         try {
-          this.pi.sendUserMessage(text, { deliverAs: "steer" });
+          this.pi.sendUserMessage(messageText, { deliverAs: "steer" });
           this.log?.(`[weixin] 已注入 Pi session (steer)`);
           return;
         } catch (err2) {

@@ -7,6 +7,7 @@
 //   /weixin-logout   — Remove a logged-in WeChat account
 //   /weixin-status   — Show connection status of all accounts
 //   /weixin-toggle   — Enable / disable message receiving
+//   /weixin-config   — Configure TUI hint injection
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { WeixinApi } from "./api.js";
@@ -18,6 +19,8 @@ import {
   unregisterAccount,
 } from "./storage.js";
 import type { WeixinAccount } from "./types.js";
+import { loadConfig, saveConfig } from "./config.js";
+import type { WeixinConfig } from "./config.js";
 
 // ── Extension State ────────────────────────────────────────────────────
 
@@ -30,6 +33,7 @@ interface ActivePoller {
 
 export default function (pi: ExtensionAPI): void {
   const api = new WeixinApi();
+  const config = loadConfig();
   const bridge = new WeixinBridge(
     {
       sendUserMessage(text, options) {
@@ -37,6 +41,7 @@ export default function (pi: ExtensionAPI): void {
       },
     },
     api,
+    config,
     (msg) => {
       // Log messages are forwarded as Pi appendEntries for session tracing
       pi.appendEntry("weixin-log", { msg, ts: Date.now() });
@@ -102,6 +107,9 @@ export default function (pi: ExtensionAPI): void {
   // ── Event Handlers ───────────────────────────────────────────────────
 
   pi.on("session_start", async (_event) => {
+    // Reset WeChat message counter for the new session
+    bridge.resetMessageCount();
+
     // Restore accounts and start polling
     startAllPollers();
     const count = pollers.size;
@@ -128,6 +136,29 @@ export default function (pi: ExtensionAPI): void {
   pi.on("agent_end", async (event) => {
     await bridge.handleAgentEnd(event.messages);
     bridge.isAgentIdle = true;
+  });
+
+  pi.on("tool_call", async (event) => {
+    if (event.toolName === "ask_user") {
+      const input = event.input as {
+        question?: string;
+        options?: Array<string | { title: string; description?: string }>;
+        context?: string;
+      };
+      const question = input.question || input.context || "Pi 需要你确认一个操作";
+      const options = input.options || [];
+
+      // Only send notification when we're currently processing a WeChat message
+      if (bridge.isProcessingWeixin) {
+        try {
+          await bridge.notifyAskUser(question, options);
+        } catch (err) {
+          // Notification failure should not affect the main agent flow
+          const msg = err instanceof Error ? err.message : String(err);
+          pi.appendEntry("weixin-askuser", { error: msg, ts: Date.now() });
+        }
+      }
+    }
   });
 
   // ── Commands ─────────────────────────────────────────────────────────
@@ -241,6 +272,83 @@ export default function (pi: ExtensionAPI): void {
       const status = bridge.enabled ? "已启用" : "已禁用";
       ctx.ui.notify(`微信消息接收${status}`, "info");
       pi.appendEntry("weixin-toggle", { enabled: bridge.enabled, ts: Date.now() });
+    },
+  });
+
+  pi.registerCommand("weixin-config", {
+    description: "Configure WeChat hint settings",
+    handler: async (args: string, ctx: ExtensionCommandContext) => {
+      const cfg = loadConfig();
+      const parts = args.trim().split(/\s+/);
+      const subcmd = parts[0] || "";
+
+      if (!subcmd || subcmd === "show") {
+        console.log("=== pi-weixin-cli 配置 ===");
+        console.log(`提示功能: ${cfg.hintsEnabled ? "已启用" : "已禁用"}`);
+        console.log(`提示间隔: 每 ${cfg.hintInterval} 条消息`);
+        console.log(`提示文本:`);
+        console.log(`  ${cfg.hintMessage}`);
+        console.log(`当前 session 已注入消息数: ${bridge.getMessageCount()}`);
+        console.log("\n用法: /weixin-config <子命令>");
+        console.log("  show          显示当前配置");
+        console.log("  toggle        启用/禁用提示");
+        console.log("  interval <N>  设置提示间隔（条数）");
+        console.log("  message <文本> 设置提示文本");
+        console.log("  reset         恢复默认配置");
+        return;
+      }
+
+      if (subcmd === "toggle") {
+        cfg.hintsEnabled = !cfg.hintsEnabled;
+        saveConfig(cfg);
+        bridge.updateConfig(cfg);
+        ctx.ui.notify(`提示功能已${cfg.hintsEnabled ? "启用" : "禁用"}`, "info");
+        return;
+      }
+
+      if (subcmd === "interval" && parts[1]) {
+        const n = parseInt(parts[1], 10);
+        if (isNaN(n) || n < 1) {
+          ctx.ui.notify("间隔必须是正整数", "error");
+          return;
+        }
+        cfg.hintInterval = n;
+        saveConfig(cfg);
+        bridge.updateConfig(cfg);
+        ctx.ui.notify(`提示间隔已设为每 ${n} 条消息`, "info");
+        return;
+      }
+
+      if (subcmd === "message") {
+        const text = parts.slice(1).join(" ").trim();
+        if (!text) {
+          ctx.ui.notify("提示文本不能为空", "error");
+          return;
+        }
+        cfg.hintMessage = text;
+        saveConfig(cfg);
+        bridge.updateConfig(cfg);
+        ctx.ui.notify("提示文本已更新", "info");
+        return;
+      }
+
+      if (subcmd === "reset") {
+        const defaultCfg: WeixinConfig = {
+          hintInterval: 3,
+          hintMessage:
+            "[系统提示] 当前用户通过微信远程交互，无法使用终端 TUI。请直接做出最佳决策，不要调用 ask_user、confirm、select 等需要用户交互的工具。",
+          hintsEnabled: true,
+        };
+        saveConfig(defaultCfg);
+        bridge.updateConfig(defaultCfg);
+        ctx.ui.notify("配置已恢复默认值", "info");
+        return;
+      }
+
+      ctx.ui.notify(
+        `未知子命令: ${subcmd}，使用 /weixin-config show 查看用法`,
+        "error",
+      );
     },
   });
 }
