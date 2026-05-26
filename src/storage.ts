@@ -1,5 +1,5 @@
 // ── Local State Persistence ────────────────────────────────────────────
-// All data stored under ~/.pi/agent/extensions/pi-weixin-cli/state/
+// All data stored under ~/.config/pi-weixin-cli/
 
 import fs from "node:fs";
 import path from "node:path";
@@ -9,14 +9,7 @@ import type { WeixinAccount, WeixinSyncState } from "./types.js";
 // ── Paths ──────────────────────────────────────────────────────────────
 
 function getStateDir(): string {
-  return path.join(
-    os.homedir(),
-    ".pi",
-    "agent",
-    "extensions",
-    "pi-weixin-cli",
-    "state",
-  );
+  return path.join(os.homedir(), ".config", "pi-weixin-cli");
 }
 
 function ensureDir(dir: string): void {

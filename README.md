@@ -172,7 +172,7 @@ pi-weixin-cli 支持接收微信图片并转发给 Pi：
 
 ## 配置
 
-配置文件位于 `~/.pi/agent/extensions/pi-weixin-cli/settings.json`：
+配置文件位于 `~/.config/pi-weixin-cli/settings.json`：
 
 ```json
 {
@@ -188,7 +188,7 @@ pi-weixin-cli 支持接收微信图片并转发给 Pi：
 
 ## 数据目录
 
-所有持久化数据保存在 `~/.pi/agent/extensions/pi-weixin-cli/state/`：
+所有持久化数据保存在 `~/.config/pi-weixin-cli/`：
 
 | 文件 | 说明 |
 |------|------|
@@ -210,7 +210,7 @@ pi-weixin-cli 支持接收微信图片并转发给 Pi：
 npm uninstall -g pi-weixin-cli
 
 # 删除项目文件
-rm -rf ~/.pi/agent/extensions/pi-weixin-cli
+rm -rf ~/.config/pi-weixin-cli ~/pi-weixin-cli
 ```
 
 ## License

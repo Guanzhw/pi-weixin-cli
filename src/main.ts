@@ -168,7 +168,7 @@ async function runDaemon(): Promise<void> {
   if (accounts.length === 0) {
     log("错误: 没有已登录的微信账号。");
     log("请先使用 'pi-weixin-cli login' 命令登录，或手动编辑 accounts.json。");
-    log("账号文件位于: ~/.pi/agent/extensions/pi-weixin-cli/state/accounts.json");
+    log("账号文件位于: ~/.config/pi-weixin-cli/accounts.json");
     process.exit(1);
   }
 

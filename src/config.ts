@@ -1,6 +1,6 @@
-// ── Weixin Extension Configuration ────────────────────────────────────
-// Persistent configuration for pi-weixin-cli extension.
-// Saves to ~/.pi/agent/extensions/pi-weixin-cli/settings.json
+// ── Configuration ──────────────────────────────────────────────────────
+// Persistent configuration for pi-weixin-cli.
+// Saves to ~/.config/pi-weixin-cli/settings.json
 
 import fs from "node:fs";
 import path from "node:path";
@@ -16,14 +16,7 @@ export const DEFAULT_CONFIG: WeixinConfig = {
 };
 
 function getConfigPath(): string {
-  return path.join(
-    os.homedir(),
-    ".pi",
-    "agent",
-    "extensions",
-    "pi-weixin-cli",
-    "settings.json",
-  );
+  return path.join(os.homedir(), ".config", "pi-weixin-cli", "settings.json");
 }
 
 export function loadConfig(): WeixinConfig {
