@@ -64,7 +64,7 @@ interface QueuedMessage {
 
 /**
  * Extract the last assistant text reply from Pi's agent_end messages array.
- * Mirrors the logic in src/bridge.ts extractAssistantReply().
+ * Mirrors bridge.ts extractAssistantReply().
  */
 function extractAssistantReply(messages: unknown[] | undefined): string | null {
   if (!messages || messages.length === 0) return null;
@@ -93,7 +93,7 @@ function extractAssistantReply(messages: unknown[] | undefined): string | null {
 
 /**
  * Send a text reply back to a WeChat user.
- * Mirrors the sendReply logic in src/bridge.ts.
+ * Mirrors bridge.ts sendReply.
  */
 async function sendWeixinReply(
   api: WeixinApi,
@@ -162,8 +162,6 @@ async function runDaemon(): Promise<void> {
     process.exit(0);
   }
 
-  const { hintInterval, hintMessage, hintsEnabled } = config;
-
   // ── Load accounts ────────────────────────────────────────────────────
   const accounts = loadAccounts();
 
@@ -185,9 +183,6 @@ async function runDaemon(): Promise<void> {
 
   // ── State Machine ────────────────────────────────────────────────────
   const sm = new StateMachine();
-
-  /** Message counter for hint injection. */
-  let messageCount = 0;
 
   /** Queue of messages waiting to be sent to Pi. */
   const messageQueue: QueuedMessage[] = [];
@@ -491,15 +486,7 @@ async function runDaemon(): Promise<void> {
       sessionId: qm.sessionId,
     };
 
-    let messageText = qm.text;
-    if (hintsEnabled) {
-      const shouldHint = messageCount % hintInterval === 0;
-      if (shouldHint) {
-        messageText = `${qm.text}\n\n${hintMessage}`;
-        log(`[weixin] 已附加提示 (第 ${messageCount + 1} 条)`);
-      }
-      messageCount++;
-    }
+    const messageText = qm.text;
 
     // ── Image processing ────────────────────────────────────────────
     let imageContents: ImageContent[] | undefined;
@@ -752,7 +739,6 @@ async function runDaemon(): Promise<void> {
     messageQueue.length = 0;
     pendingContext = null;
     processingWeixin = false;
-    messageCount = 0;
 
     // ── Exponential backoff retry loop ────────────────────────────────
     const maxRetries = 10;

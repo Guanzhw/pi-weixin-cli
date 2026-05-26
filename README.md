@@ -132,9 +132,6 @@ Weixin Backend (ilinkai.weixin.qq.com)
 | `pi-weixin-cli status` | 显示所有已保存账号的信息 |
 | `pi-weixin-cli toggle` | 启用/禁用消息接收 |
 | `pi-weixin-cli config show` | 显示当前配置 |
-| `pi-weixin-cli config toggle` | 切换提示功能（启用/禁用） |
-| `pi-weixin-cli config interval N` | 设置提示间隔（每 N 条消息附加一次提示） |
-| `pi-weixin-cli config message <文本>` | 设置附加提示的文本内容 |
 | `pi-weixin-cli config reset` | 恢复默认配置 |
 | `pi-weixin-cli --help` | 显示帮助信息 |
 
@@ -179,19 +176,13 @@ pi-weixin-cli 支持接收微信图片并转发给 Pi：
 
 ```json
 {
-  "enabled": true,
-  "hintInterval": 3,
-  "hintMessage": "[系统提示] 当前用户通过微信与 Pi 交互...",
-  "hintsEnabled": true
+  "enabled": true
 }
 ```
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `enabled` | boolean | `true` | daemon 启动时是否启用消息接收 |
-| `hintsEnabled` | boolean | `true` | 是否启用提示功能 |
-| `hintInterval` | number | `3` | 每 N 条消息附加一次提示文本 |
-| `hintMessage` | string | （系统提示） | 附加的提示文本内容 |
 
 所有配置项都可通过 `config` 命令动态修改，无需重启 daemon（下次启动时生效）。
 

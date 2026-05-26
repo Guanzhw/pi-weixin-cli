@@ -14,7 +14,6 @@ import {
   loadConfig,
   saveConfig,
   resetConfig,
-  type WeixinConfig,
 } from "./config.js";
 
 // ── Help ──────────────────────────────────────────────────────────────
@@ -30,9 +29,6 @@ const HELP = `pi-weixin-cli — 微信消息桥接工具
   status             显示所有已登录账号及其状态
   toggle             切换消息接收功能（启用/禁用）
   config show        显示当前配置
-  config toggle      切换提示功能（启用/禁用）
-  config interval N  设置提示间隔（每 N 条消息附加一次提示）
-  config message 文本  设置提示文本内容
   config reset       恢复默认配置
   --help, -h         显示此帮助信息
 
@@ -47,12 +43,6 @@ function printHelp(): void {
 
 function formatTime(ms: number): string {
   return new Date(ms).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
-}
-
-/** 截断字符串防止过长。 */
-function truncate(s: string, maxLen: number): string {
-  if (s.length <= maxLen) return s;
-  return s.slice(0, maxLen - 3) + "...";
 }
 
 // ── Handlers ───────────────────────────────────────────────────────────
@@ -151,7 +141,6 @@ function handleStatus(): number {
     process.stdout.write(`  User ID:   ${a.userId}\n`);
     process.stdout.write(`  Base URL:  ${a.baseUrl}\n`);
     process.stdout.write(`  创建时间:  ${formatTime(a.createdAt)}\n`);
-    process.stdout.write(`  状态:      已保存（daemon 未运行时无法检测在线状态）\n`);
     process.stdout.write("\n");
   }
   return 0;
@@ -181,22 +170,13 @@ function handleConfig(args: string[]): number {
   switch (sub) {
     case "show":
       return handleConfigShow();
-    case "toggle":
-      return handleConfigToggle();
-    case "interval":
-      return handleConfigInterval(args[1]);
-    case "message":
-      return handleConfigMessage(args.slice(1));
     case "reset":
       return handleConfigReset();
     default: {
       process.stderr.write(`错误: 未知的 config 子命令 "${sub ?? "(无)"}"。\n\n`);
       process.stdout.write("可用子命令:\n");
-      process.stdout.write("  show       显示当前配置\n");
-      process.stdout.write("  toggle     切换提示功能\n");
-      process.stdout.write("  interval N 设置提示间隔\n");
-      process.stdout.write("  message 文本  设置提示文本\n");
-      process.stdout.write("  reset      恢复默认配置\n");
+      process.stdout.write("  show   显示当前配置\n");
+      process.stdout.write("  reset  恢复默认配置\n");
       return 1;
     }
   }
@@ -205,51 +185,7 @@ function handleConfig(args: string[]): number {
 function handleConfigShow(): number {
   const config = loadConfig();
   process.stdout.write("当前配置:\n\n");
-  process.stdout.write(`  消息接收:    ${config.enabled ? "启用" : "禁用"}\n`);
-  process.stdout.write(`  提示功能:    ${config.hintsEnabled ? "启用" : "禁用"}\n`);
-  process.stdout.write(`  提示间隔:    ${config.hintInterval} 条\n`);
-  process.stdout.write(`  提示文本:\n`);
-  process.stdout.write(`    ${config.hintMessage}\n`);
-  return 0;
-}
-
-function handleConfigToggle(): number {
-  const config = loadConfig();
-  config.hintsEnabled = !config.hintsEnabled;
-  saveConfig(config);
-  process.stdout.write(`提示功能: ${config.hintsEnabled ? "已启用" : "已禁用"}\n`);
-  return 0;
-}
-
-function handleConfigInterval(arg: string | undefined): number {
-  if (!arg) {
-    process.stderr.write("错误: 请指定提示间隔。\n");
-    process.stdout.write("用法: pi-weixin-cli config interval <N>\n");
-    return 1;
-  }
-  const n = Number(arg);
-  if (!Number.isInteger(n) || n < 1) {
-    process.stderr.write(`错误: "${arg}" 不是有效的正整数。\n`);
-    return 1;
-  }
-  const config = loadConfig();
-  config.hintInterval = n;
-  saveConfig(config);
-  process.stdout.write(`提示间隔已设置为: ${n} 条\n`);
-  return 0;
-}
-
-function handleConfigMessage(args: string[]): number {
-  if (args.length === 0) {
-    process.stderr.write("错误: 请指定提示文本。\n");
-    process.stdout.write("用法: pi-weixin-cli config message <文本>\n");
-    return 1;
-  }
-  const text = args.join(" ");
-  const config = loadConfig();
-  config.hintMessage = text;
-  saveConfig(config);
-  process.stdout.write(`提示文本已更新:\n  ${truncate(text, 120)}\n`);
+  process.stdout.write(`  消息接收:  ${config.enabled ? "启用" : "禁用"}\n`);
   return 0;
 }
 
