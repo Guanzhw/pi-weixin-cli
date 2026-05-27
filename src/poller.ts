@@ -4,7 +4,7 @@
 
 import { WeixinApi } from "./api.js";
 import { loadSyncState, updateSyncBuf } from "./storage.js";
-import type { WeixinAccount, WeixinMessage, ImageItem } from "./types.js";
+import type { WeixinAccount, WeixinMessage, ImageItem, FileItem, VoiceItem, VideoItem } from "./types.js";
 import { MessageItemType } from "./types.js";
 
 // ── Types ──────────────────────────────────────────────────────────────
@@ -14,6 +14,9 @@ export type MessageCallback = (
   msg: WeixinMessage,
   text: string,
   imageItem?: ImageItem,
+  fileItem?: FileItem,
+  voiceItem?: VoiceItem,
+  videoItem?: VideoItem,
 ) => void;
 
 export type LogCallback = (msg: string) => void;
@@ -127,11 +130,23 @@ export class Poller {
             if (msg.message_type === 2) continue;
 
             const text = extractText(msg);
+            const voiceText = extractVoiceText(msg);
+            const voiceItem = extractVoice(msg);
+            const videoItem = extractVideo(msg);
             const imageItem = extractImage(msg);
+            const fileItem = extractFile(msg);
 
-            // Deliver if there is text or an image (or both)
-            if (text || imageItem) {
-              this.onMessage(this.account, msg, text || "", imageItem);
+            // Combine text and voice transcript; prefer explicit text, fallback to voice
+            let messageText = text || "";
+            if (voiceText) {
+              messageText = messageText
+                ? `${messageText}\n\n[语音消息] ${voiceText}`
+                : `[语音消息] ${voiceText}`;
+            }
+
+            // Deliver if there is text, an image, a file, a voice, or a video
+            if (messageText || imageItem || fileItem || voiceItem || videoItem) {
+              this.onMessage(this.account, msg, messageText, imageItem, fileItem, voiceItem, videoItem);
             }
           }
         }
@@ -182,6 +197,50 @@ function extractImage(msg: WeixinMessage): ImageItem | undefined {
     }
   }
   return undefined;
+}
+
+/** Extract the first file item from a Weixin message's item list. */
+function extractFile(msg: WeixinMessage): FileItem | undefined {
+  if (!msg.item_list || msg.item_list.length === 0) return undefined;
+  for (const item of msg.item_list) {
+    if (item.type === MessageItemType.FILE && item.file_item) {
+      return item.file_item;
+    }
+  }
+  return undefined;
+}
+
+/** Extract the first voice item from a Weixin message's item list. */
+function extractVoice(msg: WeixinMessage): VoiceItem | undefined {
+  if (!msg.item_list || msg.item_list.length === 0) return undefined;
+  for (const item of msg.item_list) {
+    if (item.type === MessageItemType.VOICE && item.voice_item) {
+      return item.voice_item;
+    }
+  }
+  return undefined;
+}
+
+/** Extract the first video item from a Weixin message's item list. */
+function extractVideo(msg: WeixinMessage): VideoItem | undefined {
+  if (!msg.item_list || msg.item_list.length === 0) return undefined;
+  for (const item of msg.item_list) {
+    if (item.type === MessageItemType.VIDEO && item.video_item) {
+      return item.video_item;
+    }
+  }
+  return undefined;
+}
+
+/** Extract voice-to-text transcript from a Weixin message's item list. */
+function extractVoiceText(msg: WeixinMessage): string | null {
+  if (!msg.item_list || msg.item_list.length === 0) return null;
+  for (const item of msg.item_list) {
+    if (item.type === MessageItemType.VOICE && item.voice_item?.text) {
+      return item.voice_item.text;
+    }
+  }
+  return null;
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {

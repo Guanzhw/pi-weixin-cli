@@ -76,6 +76,28 @@ export interface RpcGetCommandsCommand {
   id?: string;
 }
 
+export interface RpcSwitchSessionCommand {
+  type: "switch_session";
+  sessionPath: string;
+  id?: string;
+}
+
+export interface RpcGetSessionStatsCommand {
+  type: "get_session_stats";
+  id?: string;
+}
+
+export interface RpcBashCommand {
+  type: "bash";
+  command: string;
+  id?: string;
+}
+
+export interface RpcAbortBashCommand {
+  type: "abort_bash";
+  id?: string;
+}
+
 export type RpcStdinCommand =
   | RpcPromptCommand
   | RpcSteerCommand
@@ -86,7 +108,11 @@ export type RpcStdinCommand =
   | RpcCompactCommand
   | RpcGetAvailableModelsCommand
   | RpcSetModelCommand
-  | RpcGetCommandsCommand;
+  | RpcGetCommandsCommand
+  | RpcSwitchSessionCommand
+  | RpcGetSessionStatsCommand
+  | RpcBashCommand
+  | RpcAbortBashCommand;
 
 // ── Events (stdout) ────────────────────────────────────────────────────
 

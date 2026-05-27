@@ -25,16 +25,19 @@
 
 import process from "node:process";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
 
 import { WeixinApi } from "./api.js";
 import { Poller, type MessageCallback, type LogCallback } from "./poller.js";
 import { RpcClient } from "./rpc-client.js";
 import { loadAccounts, saveContextToken, loadContextTokens } from "./storage.js";
 import { loadConfig } from "./config.js";
-import type { WeixinAccount, ImageItem } from "./types.js";
+import type { WeixinAccount, ImageItem, FileItem, VoiceItem, VideoItem } from "./types.js";
 import { MessageItemType, MessageType, MessageState } from "./types.js";
-import type { AgentEndEvent, ExtensionUIRequestEvent, ImageContent } from "./types-rpc.js";
-import { processImageForPi } from "./media-handler.js";
+import type { AgentEndEvent, ExtensionUIRequestEvent } from "./types-rpc.js";
+import { saveImageLocally, saveFileLocally, saveVoiceLocally, saveVideoLocally } from "./media-handler.js";
 import { StateMachine, type UIMethod, type UIRequestContext } from "./state-machine.js";
 import { formatUIRequestForWeixin, isFireAndForget, parseUserResponse } from "./ui-bridge.js";
 import { runCLI } from "./cli.js";
@@ -58,6 +61,12 @@ interface QueuedMessage {
   text: string;
   /** Optional image item from the WeChat message. */
   imageItem?: ImageItem;
+  /** Optional file item from the WeChat message. */
+  fileItem?: FileItem;
+  /** Optional voice item from the WeChat message. */
+  voiceItem?: VoiceItem;
+  /** Optional video item from the WeChat message. */
+  videoItem?: VideoItem;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -137,8 +146,19 @@ async function sendWeixinReply(
 // ── Logging ────────────────────────────────────────────────────────────
 
 function log(msg: string): void {
-  const ts = new Date().toISOString();
+  const ts = toLocalISOString(new Date());
   process.stderr.write(`[${ts}] ${msg}\n`);
+}
+
+function toLocalISOString(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const off = -d.getTimezoneOffset();
+  const sign = off >= 0 ? "+" : "-";
+  const abs = Math.abs(off);
+  const tz = `${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T` +
+    `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.` +
+    `${String(d.getMilliseconds()).padStart(3, "0")}${tz}`;
 }
 
 // ── Slash Command Type ─────────────────────────────────────────────────
@@ -148,10 +168,15 @@ interface SlashCommand {
   args: string;
 }
 
+interface BashCommand {
+  command: string;
+}
+
 // ── Daemon ─────────────────────────────────────────────────────────────
 
 async function runDaemon(): Promise<void> {
   log("pi-weixin-cli RPC 模式启动中...");
+  const daemonCwd = process.cwd();
 
   // ── Load config ──────────────────────────────────────────────────────
   const config = loadConfig();
@@ -193,6 +218,101 @@ async function runDaemon(): Promise<void> {
   /** Pending model selections: userId → models array (for /model flow). */
   const pendingModelSelections = new Map<string, unknown[]>();
 
+  /** Pending session selections: userId → sessions array (for /resume flow). */
+  const pendingResumeSelections = new Map<
+    string,
+    { path: string; label: string }[]
+  >();
+
+  /** Pending fork selections: userId → fork messages array (for /fork flow). */
+  const pendingForkSelections = new Map<
+    string,
+    { entryId: string; text: string }[]
+  >();
+
+  // ── Session listing helper ─────────────────────────────────────────
+
+  /** Scan ~/.pi/agent/sessions/ and return the most recent N sessions. */
+  /**
+   * Read the first 16KB of a session file to extract a human-readable title.
+   * Returns the session name (set_session_name), first user message, or null.
+   */
+  function extractSessionTitle(filePath: string): string | null {
+    const BUF_SIZE = 16384;
+    const buf = Buffer.alloc(BUF_SIZE);
+    let fd: number | undefined;
+    try {
+      fd = fs.openSync(filePath, "r");
+      const bytesRead = fs.readSync(fd, buf, 0, BUF_SIZE, 0);
+      const raw = buf.toString("utf-8", 0, bytesRead);
+
+      for (const line of raw.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const entry = JSON.parse(line);
+          // Prefer explicit session name
+          if (entry.type === "set_session_name" && entry.name) return entry.name;
+          // Fall back to first user message
+          if (entry.type === "message" && entry.message?.role === "user") {
+            const content = entry.message.content;
+            if (Array.isArray(content) && content.length > 0) {
+              const first = content[0];
+              if (first?.type === "text" && first.text) {
+                return first.text.replace(/\n/g, " ").slice(0, 60);
+              }
+            }
+          }
+        } catch { /* skip malformed */ }
+      }
+    } catch { /* file read error */
+    } finally {
+      if (fd !== undefined) try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+    return null;
+  }
+
+  /** Scan ~/.pi/agent/sessions/ and return the most recent N sessions. */
+  function listRecentSessions(limit = 10): { path: string; label: string }[] {
+    const sessionsDir = path.join(os.homedir(), ".pi", "agent", "sessions");
+    const entries: { path: string; mtime: number; label: string }[] = [];
+
+    try {
+      for (const project of fs.readdirSync(sessionsDir)) {
+        const projectDir = path.join(sessionsDir, project);
+        let isDir = false;
+        try { isDir = fs.statSync(projectDir).isDirectory(); } catch { continue; }
+        if (!isDir) continue;
+
+        for (const file of fs.readdirSync(projectDir)) {
+          if (!file.endsWith(".jsonl")) continue;
+          const filePath = path.join(projectDir, file);
+          let fileStat: fs.Stats;
+          try { fileStat = fs.statSync(filePath); } catch { continue; }
+
+          // Parse filename timestamp: "2026-05-27T11-13-09-592Z_uuid.jsonl"
+          const tsMatch = file.match(/^\d{4}-(\d{2})-(\d{2})T(\d{2})-(\d{2})/);
+          const shortTs = tsMatch
+            ? `${tsMatch[1]}-${tsMatch[2]} ${tsMatch[3]}:${tsMatch[4]}`
+            : file.slice(0, 20);
+
+          const title = extractSessionTitle(filePath);
+          const displayTitle = title ?? "(无标题)";
+
+          entries.push({
+            path: filePath,
+            mtime: fileStat.mtimeMs,
+            label: `${shortTs}  ${displayTitle}  [${project}]`,
+          });
+        }
+      }
+    } catch {
+      return [];
+    }
+
+    entries.sort((a, b) => b.mtime - a.mtime);
+    return entries.slice(0, limit);
+  }
+
   // ── Slash command helpers ──────────────────────────────────────────
 
   /** Parse a slash command from message text. Returns null if not a command. */
@@ -210,22 +330,94 @@ async function runDaemon(): Promise<void> {
     };
   }
 
+  /** Parse a bash command from message text. Returns null if not a command. */
+  function parseBashCommand(text: string): BashCommand | null {
+    const trimmed = text.trim();
+    if (!trimmed.startsWith("!")) return null;
+    return { command: trimmed.startsWith("!!") ? trimmed.slice(2).trim() : trimmed.slice(1).trim() };
+  }
+
   /** Format session state into a human-readable text block. */
-  function formatSessionState(state: unknown): string {
-    if (state === null || typeof state !== "object") {
-      return `📊 Session 状态: ${JSON.stringify(state)}`;
+  /** Format a number of tokens in compact form: 75000 → "75.0k", 3000000 → "3.0M". */
+  function fmtTokens(n: number): string {
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+    if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+    return String(n);
+  }
+
+  /** Read the session JSONL file's first event to extract cwd. */
+  function getSessionCwd(sessionFile: string): string | null {
+    try {
+      const fd = fs.openSync(sessionFile, "r");
+      const buf = Buffer.alloc(512);
+      const n = fs.readSync(fd, buf, 0, 512, 0);
+      fs.closeSync(fd);
+      const firstLine = buf.toString("utf-8", 0, n).split("\n")[0];
+      const entry = JSON.parse(firstLine);
+      return (entry.cwd as string) ?? null;
+    } catch {
+      return null;
     }
-    const s = state as Record<string, unknown>;
-    const lines = ["📊 Session 状态："];
-    if (s.sessionId !== undefined) lines.push(`会话ID: ${s.sessionId}`);
-    if (s.model !== undefined) {
-      const model = s.model as Record<string, unknown> | string;
-      const modelName = typeof model === "string" ? model : (model.name ?? model.id ?? JSON.stringify(model));
-      lines.push(`模型: ${modelName}`);
+  }
+
+  function formatSessionState(state: unknown, stats?: unknown): string {
+    const lines: string[] = [];
+    let autoCompactTag = "";
+
+    // ── Header: model + thinking ────────────────────────────────────
+    if (state !== null && typeof state === "object") {
+      const s = state as Record<string, unknown>;
+      const model = s.model as Record<string, unknown> | string | undefined;
+      const modelName = typeof model === "string"
+        ? model
+        : (model?.name ?? model?.id ?? "?") as string;
+      const thinking = (s.thinkingLevel ?? "?") as string;
+      const msgCount = s.messageCount !== undefined ? ` · ${s.messageCount}msgs` : "";
+      autoCompactTag = s.autoCompactionEnabled ? "(auto)" : "";
+
+      // Get cwd from session file (first JSONL event), fallback to daemon cwd
+      const sessionFile = s.sessionFile as string | undefined;
+      const cwd = sessionFile ? (getSessionCwd(sessionFile) ?? daemonCwd) : daemonCwd;
+
+      lines.push(`📊 ${modelName} · ${thinking}${msgCount}` + (cwd ? ` · ${cwd}` : ""));
+    } else {
+      lines.push("📊 Session 状态");
     }
-    if (s.thinkingLevel !== undefined) lines.push(`思考级别: ${s.thinkingLevel}`);
-    if (s.isStreaming !== undefined) lines.push(`流式输出: ${s.isStreaming ? "是" : "否"}`);
-    if (s.messageCount !== undefined) lines.push(`消息数: ${s.messageCount}`);
+
+    // ── Stats line: ↑input ↓output Rremaining $cost percent%/window ──
+    if (stats !== null && typeof stats === "object") {
+      const st = stats as Record<string, unknown>;
+      const tokens = st.tokens as Record<string, number> | undefined;
+      const ctx = st.contextUsage as Record<string, unknown> | undefined;
+
+      if (tokens) {
+        const input = tokens.input ?? 0;
+        const output = tokens.output ?? 0;
+        const total = tokens.total ?? 0;
+        const cost = (st.cost as number) ?? 0;
+
+        const statsParts: string[] = [];
+        statsParts.push(`↑${fmtTokens(input)}`);
+        statsParts.push(`↓${fmtTokens(output)}`);
+
+        if (ctx) {
+          const ctxWindow = ctx.contextWindow as number;
+          const ctxPercent = ctx.percent as number | null;
+          if (ctxWindow) {
+            const remaining = ctxWindow - (tokens.input + tokens.cacheWrite + tokens.output);
+            statsParts.push(`R${fmtTokens(Math.max(0, remaining))}`);
+          }
+          if (ctxPercent !== null && ctxPercent !== undefined) {
+            statsParts.push(`${ctxPercent.toFixed(1)}%/${fmtTokens(ctxWindow)}`);
+          }
+        }
+
+        statsParts.push(cost === 0 ? "$0" : `$${cost.toFixed(2)}`);
+        if (autoCompactTag) statsParts.push(autoCompactTag);
+        lines.push(statsParts.join(" "));
+      }
+    }
+
     return lines.join("\n");
   }
 
@@ -245,31 +437,173 @@ async function runDaemon(): Promise<void> {
     try {
       switch (cmd.command) {
         case "new": {
-          await rpcClient.newSession();
-          await sendWeixinReply(api, account, userId, contextToken, sessionId, "✅ 已新建 session");
-          log(`[slash] /new → 已新建 session (user=${userId})`);
+          const result = (await rpcClient.newSession()) as { cancelled?: boolean } | null;
+          const cancelled = result?.cancelled;
+          await sendWeixinReply(api, account, userId, contextToken, sessionId,
+            cancelled ? "⚠️ 新建 session 被取消" : "✅ 已新建 session");
+          log(`[slash] /new (user=${userId})`);
           break;
         }
 
         case "compact": {
-          await rpcClient.compact(cmd.args || undefined);
-          await sendWeixinReply(api, account, userId, contextToken, sessionId, "✅ 上下文已压缩");
-          log(`[slash] /compact → 已压缩 (user=${userId})`);
+          const result = (await rpcClient.compact(cmd.args || undefined)) as { summary?: string } | null;
+          const summary = result?.summary ? `\n\n摘要: ${result.summary.slice(0, 200)}` : "";
+          await sendWeixinReply(api, account, userId, contextToken, sessionId,
+            `✅ 上下文已压缩${summary}`);
+          log(`[slash] /compact (user=${userId})`);
           break;
         }
 
         case "abort": {
           rpcClient.sendAbort();
           await sendWeixinReply(api, account, userId, contextToken, sessionId, "✅ 已中止当前任务");
-          log(`[slash] /abort → 已中止 (user=${userId})`);
+          log(`[slash] /abort (user=${userId})`);
           break;
         }
 
         case "session": {
-          const state = await rpcClient.getState();
-          const formatted = formatSessionState(state);
+          const [state, stats] = await Promise.all([
+            rpcClient.getState(),
+            rpcClient.getSessionStats().catch(() => null),
+          ]);
+          const formatted = formatSessionState(state, stats);
           await sendWeixinReply(api, account, userId, contextToken, sessionId, formatted);
-          log(`[slash] /session → 已返回状态 (user=${userId})`);
+          log(`[slash] /session (user=${userId})`);
+          break;
+        }
+
+        case "messages": {
+          const result = (await rpcClient.getMessages()) as { messages?: unknown[] } | null;
+          const messages = result?.messages ?? [];
+          if (messages.length === 0) {
+            await sendWeixinReply(api, account, userId, contextToken, sessionId, "📭 当前 session 没有消息");
+            return;
+          }
+          const lines: string[] = [`📋 最近 ${Math.min(messages.length, 20)} 条消息：`];
+          const recent = messages.slice(-20);
+          for (const msg of recent) {
+            const m = msg as Record<string, unknown>;
+            const role = (m.role ?? "unknown") as string;
+            let text = "";
+            const content = m.content;
+            if (Array.isArray(content)) {
+              const first = content[0] as Record<string, unknown> | undefined;
+              text = (first?.text ?? first?.data ?? "") as string;
+            } else if (typeof content === "string") {
+              text = content;
+            }
+            text = text.replace(/\n/g, " ").slice(0, 60);
+            lines.push(`[${role}] ${text || "(无文本)"}`);
+          }
+          await sendWeixinReply(api, account, userId, contextToken, sessionId, lines.join("\n"));
+          log(`[slash] /messages (user=${userId}, count=${messages.length})`);
+          break;
+        }
+
+        case "export": {
+          const result = (await rpcClient.exportHtml(cmd.args || undefined)) as { path?: string } | null;
+          const exportPath = result?.path ?? "(未知路径)";
+          await sendWeixinReply(api, account, userId, contextToken, sessionId,
+            `✅ Session 已导出\n📄 ${exportPath}`);
+          log(`[slash] /export → ${exportPath} (user=${userId})`);
+          break;
+        }
+
+        case "clone": {
+          const result = (await rpcClient.clone()) as { cancelled?: boolean } | null;
+          const cancelled = result?.cancelled;
+          await sendWeixinReply(api, account, userId, contextToken, sessionId,
+            cancelled ? "⚠️ 克隆被取消" : "✅ 已克隆当前 session");
+          log(`[slash] /clone (user=${userId})`);
+          break;
+        }
+
+        case "last": {
+          const result = (await rpcClient.getLastAssistantText()) as { text?: string | null } | null;
+          const text = result?.text ?? "(无 assistant 回复)";
+          await sendWeixinReply(api, account, userId, contextToken, sessionId,
+            `🤖 最后一条回复:\n\n${text}`);
+          log(`[slash] /last (user=${userId})`);
+          break;
+        }
+
+        case "cycle-model": {
+          const result = (await rpcClient.cycleModel()) as { model?: { name?: string; id?: string } } | null;
+          const modelName = result?.model?.name ?? result?.model?.id ?? "未知模型";
+          await sendWeixinReply(api, account, userId, contextToken, sessionId,
+            `✅ 已切换模型: ${modelName}`);
+          log(`[slash] /cycle-model → ${modelName} (user=${userId})`);
+          break;
+        }
+
+        case "thinking": {
+          if (cmd.args) {
+            await rpcClient.setThinkingLevel(cmd.args);
+            await sendWeixinReply(api, account, userId, contextToken, sessionId,
+              `✅ Thinking level 已设置为: ${cmd.args}`);
+            log(`[slash] /thinking ${cmd.args} (user=${userId})`);
+          } else {
+            const result = (await rpcClient.cycleThinkingLevel()) as { level?: string } | null;
+            const level = result?.level ?? "未知";
+            await sendWeixinReply(api, account, userId, contextToken, sessionId,
+              `✅ Thinking level 已切换为: ${level}`);
+            log(`[slash] /thinking cycle → ${level} (user=${userId})`);
+          }
+          break;
+        }
+
+        case "steer-mode": {
+          const mode = cmd.args || "one-at-a-time";
+          await rpcClient.setSteeringMode(mode);
+          await sendWeixinReply(api, account, userId, contextToken, sessionId,
+            `✅ Steering mode 已设置为: ${mode}`);
+          log(`[slash] /steer-mode ${mode} (user=${userId})`);
+          break;
+        }
+
+        case "follow-mode": {
+          const mode = cmd.args || "one-at-a-time";
+          await rpcClient.setFollowUpMode(mode);
+          await sendWeixinReply(api, account, userId, contextToken, sessionId,
+            `✅ Follow-up mode 已设置为: ${mode}`);
+          log(`[slash] /follow-mode ${mode} (user=${userId})`);
+          break;
+        }
+
+        case "auto-compact": {
+          const enabled = cmd.args === "on" || cmd.args === "true";
+          await rpcClient.setAutoCompaction(enabled);
+          await sendWeixinReply(api, account, userId, contextToken, sessionId,
+            `✅ 自动压缩已${enabled ? "开启" : "关闭"}`);
+          log(`[slash] /auto-compact ${enabled} (user=${userId})`);
+          break;
+        }
+
+        case "auto-retry": {
+          const enabled = cmd.args === "on" || cmd.args === "true";
+          await rpcClient.setAutoRetry(enabled);
+          await sendWeixinReply(api, account, userId, contextToken, sessionId,
+            `✅ 自动重试已${enabled ? "开启" : "关闭"}`);
+          log(`[slash] /auto-retry ${enabled} (user=${userId})`);
+          break;
+        }
+
+        case "abort-retry": {
+          await rpcClient.abortRetry();
+          await sendWeixinReply(api, account, userId, contextToken, sessionId, "✅ 已中止重试");
+          log(`[slash] /abort-retry (user=${userId})`);
+          break;
+        }
+
+        case "name": {
+          if (!cmd.args) {
+            await sendWeixinReply(api, account, userId, contextToken, sessionId, "⚠️ 用法: /name <session名称>");
+            return;
+          }
+          await rpcClient.setSessionName(cmd.args);
+          await sendWeixinReply(api, account, userId, contextToken, sessionId,
+            `✅ Session 名称已设置为: ${cmd.args}`);
+          log(`[slash] /name ${cmd.args} (user=${userId})`);
           break;
         }
 
@@ -280,9 +614,7 @@ async function runDaemon(): Promise<void> {
             await sendWeixinReply(api, account, userId, contextToken, sessionId, "⚠️ 未获取到可用模型列表");
             return;
           }
-
           pendingModelSelections.set(userId, models);
-
           const lines = ["📋 可用模型列表："];
           models.forEach((m: unknown, i: number) => {
             const item = m as Record<string, unknown>;
@@ -292,9 +624,44 @@ async function runDaemon(): Promise<void> {
             lines.push(`${i + 1}. ${provider}${name}${current}`);
           });
           lines.push("", "回复数字编号切换模型");
-
           await sendWeixinReply(api, account, userId, contextToken, sessionId, lines.join("\n"));
-          log(`[slash] /model → 已发送模型列表 (${models.length} 个, user=${userId})`);
+          log(`[slash] /model → ${models.length} 个模型 (user=${userId})`);
+          break;
+        }
+
+        case "resume": {
+          const sessions = listRecentSessions(10);
+          if (sessions.length === 0) {
+            await sendWeixinReply(api, account, userId, contextToken, sessionId, "⚠️ 未找到历史 session");
+            return;
+          }
+          pendingResumeSelections.set(userId, sessions);
+          const lines = ["📋 最近 session："];
+          sessions.forEach((s, i) => {
+            lines.push(`${i + 1}. ${s.label}`);
+          });
+          lines.push("", "回复数字编号恢复 session");
+          await sendWeixinReply(api, account, userId, contextToken, sessionId, lines.join("\n"));
+          log(`[slash] /resume → ${sessions.length} 个 session (user=${userId})`);
+          break;
+        }
+
+        case "fork": {
+          const result = (await rpcClient.getForkMessages()) as { messages?: { entryId: string; text: string }[] } | null;
+          const messages = result?.messages ?? [];
+          if (messages.length === 0) {
+            await sendWeixinReply(api, account, userId, contextToken, sessionId, "⚠️ 没有可 fork 的消息");
+            return;
+          }
+          pendingForkSelections.set(userId, messages);
+          const lines = ["📋 可 fork 的消息："];
+          messages.forEach((m, i) => {
+            const preview = m.text.replace(/\n/g, " ").slice(0, 60);
+            lines.push(`${i + 1}. ${preview || "(空消息)"}`);
+          });
+          lines.push("", "回复数字编号选择 fork 起点");
+          await sendWeixinReply(api, account, userId, contextToken, sessionId, lines.join("\n"));
+          log(`[slash] /fork → ${messages.length} 条消息 (user=${userId})`);
           break;
         }
 
@@ -302,27 +669,46 @@ async function runDaemon(): Promise<void> {
           const helpText = [
             "📋 可用命令：",
             "/new — 新建 session",
-            "/compact — 压缩上下文",
+            "/compact [instructions] — 压缩上下文",
             "/abort — 中止当前任务",
             "/session — 查看 session 状态",
+            "/messages — 查看对话消息",
+            "/export [path] — 导出 session 为 HTML",
+            "/resume — 恢复历史 session",
             "/model — 切换模型",
+            "/cycle-model — 轮播模型",
+            "/thinking [level] — 设置/切换 thinking level",
+            "/steer-mode <mode> — 设置 steering 模式",
+            "/follow-mode <mode> — 设置 follow-up 模式",
+            "/auto-compact <on|off> — 自动压缩开关",
+            "/auto-retry <on|off> — 自动重试开关",
+            "/abort-retry — 中止重试",
+            "/clone — 克隆当前 session",
+            "/fork — 从历史消息 fork",
+            "/last — 最后一条 assistant 回复",
+            "/name <name> — 设置 session 名称",
             "/help — 显示此帮助",
+            "",
+            "Pi 扩展命令也可以直接发送，如 /skill:xxx",
           ].join("\n");
           await sendWeixinReply(api, account, userId, contextToken, sessionId, helpText);
-          log(`[slash] /help → 已发送帮助 (user=${userId})`);
+          log(`[slash] /help (user=${userId})`);
           break;
         }
 
-        default:
-          await sendWeixinReply(
-            api,
-            account,
-            userId,
-            contextToken,
-            sessionId,
-            `⚠️ 未知命令: /${cmd.command}。发送 /help 查看可用命令。`,
-          );
-          log(`[slash] 未知命令: /${cmd.command} (user=${userId})`);
+        default: {
+          // 未知命令 —— 通用转发给 Pi
+          const fullCmd = cmd.args ? `/${cmd.command} ${cmd.args}` : `/${cmd.command}`;
+          if (rpcClient.isStreaming) {
+            rpcClient.sendPromptSteer(fullCmd);
+          } else {
+            rpcClient.sendPrompt(fullCmd);
+          }
+          await sendWeixinReply(api, account, userId, contextToken, sessionId,
+            `✅ 已转发: ${fullCmd}`);
+          log(`[slash] 通用转发: ${fullCmd} (user=${userId})`);
+          break;
+        }
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -334,6 +720,56 @@ async function runDaemon(): Promise<void> {
         contextToken,
         sessionId,
         `❌ 命令 /${cmd.command} 执行失败: ${errMsg}`,
+      ).catch(() => {});
+    }
+  }
+
+  /**
+   * Execute a shell command via Pi's RPC bash tool and reply the output to the WeChat user.
+   * The bash result is automatically stored as a BashExecutionMessage in Pi's message state
+   * and will be included in the LLM context on the next prompt (same as TUI `!` behavior).
+   */
+  async function handleBashCommand(
+    cmd: BashCommand,
+    account: WeixinAccount,
+    userId: string,
+    contextToken: string,
+    sessionId: string,
+  ): Promise<void> {
+    if (!rpcClient) return;
+
+    try {
+      const result = (await rpcClient.sendBash(cmd.command)) as {
+        output: string;
+        exitCode: number;
+        cancelled: boolean;
+        truncated: boolean;
+        fullOutputPath?: string;
+      };
+
+      let outputText = result.output ?? "";
+      if (result.truncated && result.fullOutputPath) {
+        outputText += `\n\n(输出已截断，完整日志: ${result.fullOutputPath})`;
+      }
+
+      const exitEmoji = result.exitCode === 0 ? "✅" : `❌ (exit ${result.exitCode})`;
+      const cancelledTag = result.cancelled ? " ⏹️ 已取消" : "";
+
+      // Reply to WeChat user with command output
+      const userReply = `${exitEmoji} \`${cmd.command}\`${cancelledTag}\n\`\`\`\n${outputText}\n\`\`\``;
+      await sendWeixinReply(api, account, userId, contextToken, sessionId, userReply);
+
+
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      log(`[bash] 执行失败: ${errMsg}`);
+      await sendWeixinReply(
+        api,
+        account,
+        userId,
+        contextToken,
+        sessionId,
+        `❌ 命令执行失败: ${errMsg}`,
       ).catch(() => {});
     }
   }
@@ -350,7 +786,7 @@ async function runDaemon(): Promise<void> {
     log(`[poller] ${msg}`);
   };
 
-  const onMessage: MessageCallback = (account, msg, text, imageItem) => {
+  const onMessage: MessageCallback = (account, msg, text, imageItem, fileItem, voiceItem, videoItem) => {
     // Guard: if Pi is not connected, discard messages (reconnect in progress)
     if (!rpcClient) {
       log(`[weixin] 收到消息但 Pi 未连接，丢弃: ${text.slice(0, 40)}...`);
@@ -414,10 +850,90 @@ async function runDaemon(): Promise<void> {
       pendingModelSelections.delete(userId);
     }
 
+    // ── Pending resume selection check (for /resume flow) ──────────
+    const pendingSessions = pendingResumeSelections.get(userId);
+    if (pendingSessions) {
+      const num = parseInt(text.trim(), 10);
+      if (!isNaN(num) && num >= 1 && num <= pendingSessions.length) {
+        pendingResumeSelections.delete(userId);
+        const session = pendingSessions[num - 1];
+
+        void (async () => {
+          try {
+            const result = (await rpcClient!.switchSession(session.path)) as Record<string, unknown> | null;
+            const cancelled = result?.data ? (result.data as Record<string, unknown>).cancelled : false;
+            if (cancelled) {
+              await sendWeixinReply(api, account, userId, latestToken, sessionId, "⚠️ Session 切换被取消");
+            } else {
+              await sendWeixinReply(
+                api, account, userId, latestToken, sessionId,
+                `✅ 已恢复 session: ${session.label}`,
+              );
+            }
+            log(`[slash] session 已切换: ${session.path} (user=${userId})`);
+          } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            log(`[slash] 切换 session 失败: ${errMsg}`);
+            await sendWeixinReply(
+              api, account, userId, latestToken, sessionId,
+              `❌ 切换 session 失败: ${errMsg}`,
+            ).catch(() => {});
+          }
+        })();
+        return;
+      }
+      // Not a valid selection — clear pending and fall through
+      pendingResumeSelections.delete(userId);
+    }
+
+    // ── Pending fork selection check (for /fork flow) ─────────────────
+    const pendingForks = pendingForkSelections.get(userId);
+    if (pendingForks) {
+      const num = parseInt(text.trim(), 10);
+      if (!isNaN(num) && num >= 1 && num <= pendingForks.length) {
+        pendingForkSelections.delete(userId);
+        const forkMsg = pendingForks[num - 1];
+
+        void (async () => {
+          try {
+            const result = (await rpcClient!.fork(forkMsg.entryId)) as { text?: string; cancelled?: boolean } | null;
+            const cancelled = result?.cancelled;
+            if (cancelled) {
+              await sendWeixinReply(api, account, userId, latestToken, sessionId, "⚠️ Fork 被取消");
+            } else {
+              const preview = result?.text ? result.text.replace(/\n/g, " ").slice(0, 60) : "";
+              await sendWeixinReply(
+                api, account, userId, latestToken, sessionId,
+                `✅ 已从消息 fork\n原文: ${preview || "(空)"}`,
+              );
+            }
+            log(`[slash] fork 完成: ${forkMsg.entryId} (user=${userId})`);
+          } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            log(`[slash] fork 失败: ${errMsg}`);
+            await sendWeixinReply(
+              api, account, userId, latestToken, sessionId,
+              `❌ Fork 失败: ${errMsg}`,
+            ).catch(() => {});
+          }
+        })();
+        return;
+      }
+      // Not a valid selection — clear pending and fall through
+      pendingForkSelections.delete(userId);
+    }
+
     // ── Slash command detection ───────────────────────────────────────
     const slashResult = parseSlashCommand(text);
     if (slashResult) {
       void handleSlashCommand(slashResult, account, userId, latestToken, sessionId);
+      return;
+    }
+
+    // ── Bash command detection (! / !!) ───────────────────────────────
+    const bashResult = parseBashCommand(text);
+    if (bashResult) {
+      void handleBashCommand(bashResult, account, userId, latestToken, sessionId);
       return;
     }
 
@@ -453,6 +969,9 @@ async function runDaemon(): Promise<void> {
         sessionId,
         text,
         imageItem,
+        fileItem,
+        voiceItem,
+        videoItem,
       }).catch((err) => log(`[weixin] 注入失败: ${err instanceof Error ? err.message : String(err)}`));
     } else {
       // Pi is busy or already processing — queue
@@ -464,6 +983,9 @@ async function runDaemon(): Promise<void> {
         sessionId,
         text,
         imageItem,
+        fileItem,
+        voiceItem,
+        videoItem,
       });
     }
   };
@@ -486,20 +1008,19 @@ async function runDaemon(): Promise<void> {
       sessionId: qm.sessionId,
     };
 
-    const messageText = qm.text;
+    let messageText = qm.text;
+    let imagePath: string | null = null;
 
-    // ── Image processing ────────────────────────────────────────────
-    let imageContents: ImageContent[] | undefined;
+    // ── Image processing (save locally, give path to Pi) ────────────
     if (qm.imageItem) {
       try {
         log(`[weixin] 处理图片...`);
-        const result = await processImageForPi(qm.imageItem);
-        if (result) {
-          imageContents = [result];
-          log(`[weixin] 图片已下载并转换 (${result.mimeType}, ${(result.data.length / 1024).toFixed(1)}KB base64)`);
+        const savedPath = await saveImageLocally(qm.imageItem);
+        if (savedPath) {
+          imagePath = savedPath;
+          log(`[weixin] 图片已保存: ${savedPath}`);
         } else {
           log(`[weixin] 图片处理失败：无法获取图片 URL`);
-          // Send degradation notice
           await sendWeixinReply(
             api,
             qm.account,
@@ -511,7 +1032,6 @@ async function runDaemon(): Promise<void> {
         }
       } catch (err) {
         log(`[weixin] 图片处理异常: ${err instanceof Error ? err.message : String(err)}`);
-        // Send degradation notice
         await sendWeixinReply(
           api,
           qm.account,
@@ -523,9 +1043,88 @@ async function runDaemon(): Promise<void> {
       }
     }
 
-    const summary = qm.text.slice(0, 60) || (imageContents ? `[图片]` : "[空消息]");
-    log(`[weixin] 发送 prompt: ${summary}${qm.text.length > 60 ? "..." : ""}${imageContents ? ` + ${imageContents.length} 张图片` : ""}`);
-    rpcClient.sendPrompt(messageText, imageContents);
+    // Append image path to message text if present
+    if (imagePath) {
+      messageText += `\n\n[用户发送了一张图片]\n🖼️ ${imagePath}`;
+    }
+
+    // ── File processing (store locally, give path to Pi) ──────────────
+    let filePath: string | null = null;
+    if (qm.fileItem) {
+      try {
+        log(`[weixin] 处理文件...`);
+        const savedPath = await saveFileLocally(qm.fileItem);
+        if (savedPath) {
+          filePath = savedPath;
+          log(`[weixin] 文件已保存: ${savedPath}`);
+        } else {
+          log(`[weixin] 文件处理失败：无法获取下载 URL`);
+        }
+      } catch (err) {
+        const fileName = qm.fileItem.file_name ?? "unknown";
+        log(`[weixin] 文件处理异常 (${fileName}): ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    // Append file path to message text if present
+    if (filePath) {
+      const fileName = qm.fileItem?.file_name ?? "unknown";
+      messageText += `\n\n[用户发送了一个文件：${fileName}]\n📄 ${filePath}`;
+    }
+
+    // ── Voice processing (save locally, give path + transcript to Pi) ─
+    let voicePath: string | null = null;
+    if (qm.voiceItem) {
+      try {
+        log(`[weixin] 处理语音...`);
+        const savedPath = await saveVoiceLocally(qm.voiceItem);
+        if (savedPath) {
+          voicePath = savedPath;
+          log(`[weixin] 语音已保存: ${savedPath}`);
+        } else {
+          log(`[weixin] 语音处理失败：无法获取下载 URL`);
+        }
+      } catch (err) {
+        log(`[weixin] 语音处理异常: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    // Append voice path to message text if present
+    if (voicePath) {
+      messageText += `\n\n[用户发送了一条语音]\n🎤 ${voicePath}`;
+    }
+
+    // ── Video processing (save locally, give path to Pi) ────────────
+    let videoPath: string | null = null;
+    if (qm.videoItem) {
+      try {
+        log(`[weixin] 处理视频...`);
+        const savedPath = await saveVideoLocally(qm.videoItem);
+        if (savedPath) {
+          videoPath = savedPath;
+          log(`[weixin] 视频已保存: ${savedPath}`);
+        } else {
+          log(`[weixin] 视频处理失败：无法获取下载 URL`);
+        }
+      } catch (err) {
+        log(`[weixin] 视频处理异常: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    // Append video path to message text if present
+    if (videoPath) {
+      messageText += `\n\n[用户发送了一个视频]\n🎬 ${videoPath}`;
+    }
+
+    // Ensure message is not empty
+    if (!messageText.trim()) {
+      messageText = imagePath ? "[图片]" : filePath ? "[文件]" : voicePath ? "[语音]" : videoPath ? "[视频]" : "[空消息]";
+    }
+
+    const summary = messageText.slice(0, 60) || "[空消息]";
+    const fileInfo = qm.fileItem ? ` + 文件: ${qm.fileItem.file_name ?? "unknown"}` : "";
+    log(`[weixin] 发送 prompt: ${summary}${messageText.length > 60 ? "..." : ""}${imagePath ? ` + 图片: ${imagePath}` : ""}${voicePath ? ` + 语音: ${voicePath}` : ""}${videoPath ? ` + 视频: ${videoPath}` : ""}${fileInfo}`);
+    rpcClient.sendPrompt(messageText);
   }
 
   /**
@@ -558,14 +1157,17 @@ async function runDaemon(): Promise<void> {
     });
 
     client.on("agent_end", async (event: AgentEndEvent) => {
-      log("[rpc] agent_end");
+      const aborted = event.aborted ?? false;
+      const reply = extractAssistantReply(event.messages);
+      const hasPending = pendingContext !== null;
+
+      log(`[rpc] agent_end | aborted=${aborted} hasPending=${hasPending} hasReply=${!!reply}`);
 
       // If we were processing a WeChat message, send the reply back
-      if (pendingContext !== null) {
+      if (hasPending && pendingContext) {
         const ctx = pendingContext;
         pendingContext = null;
 
-        const reply = extractAssistantReply(event.messages);
         if (reply) {
           await sendWeixinReply(
             api,
@@ -577,9 +1179,21 @@ async function runDaemon(): Promise<void> {
           );
         } else {
           log("[weixin] agent_end 中未找到 assistant 文本回复");
+          // Notify user that Pi produced no output (likely a model/API issue)
+          await sendWeixinReply(
+            api,
+            ctx.account,
+            ctx.userId,
+            ctx.contextToken,
+            ctx.sessionId,
+            "⚠️ Pi 未生成回复。可能是当前模型不支持此输入（如图片），或处理异常。可尝试切换模型。",
+          ).catch(() => {});
         }
 
         processingWeixin = false;
+      } else if (reply) {
+        // Got a reply but no pending context — Pi retried after we cleared context
+        log(`[weixin] 发现延迟回复但 pendingContext 已清空: ${reply.slice(0, 60)}...`);
       }
 
       // Transition to idle

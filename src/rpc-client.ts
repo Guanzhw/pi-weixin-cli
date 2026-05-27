@@ -1,6 +1,6 @@
 // ── Pi RPC Client ──────────────────────────────────────────────────────
 // JSONL communication layer for the Pi RPC protocol.
-// Spawns `pi --mode rpc --no-session` and communicates via stdin/stdout.
+// Spawns `pi --mode rpc` and communicates via stdin/stdout.
 //
 // Protocol:
 //   stdin  → write JSONL commands (each line is a JSON object terminated by \n)
@@ -102,7 +102,7 @@ export class RpcClient extends EventEmitter<RpcClientEvents> {
     }
 
     return new Promise<void>((resolve, reject) => {
-      const child = spawn(this.piPath, ["--mode", "rpc", "--no-session"], {
+      const child = spawn(this.piPath, ["--mode", "rpc"], {
         stdio: ["pipe", "pipe", "pipe"],
         env: { ...process.env },
       });
@@ -220,6 +220,19 @@ export class RpcClient extends EventEmitter<RpcClientEvents> {
       cmdRec.id = `req-${++this.requestIdCounter}`;
     }
     const line = JSON.stringify(cmd) + "\n";
+
+    // Debug: log outgoing commands (truncate images to avoid noise)
+    const cmdType = cmdRec.type as string;
+    if (cmdType === "prompt" || cmdType === "steer") {
+      const msg = cmdRec.message as string | undefined;
+      const images = cmdRec.images as Array<{ mimeType?: string; data?: string }> | undefined;
+      const imgInfo = images && images.length > 0
+        ? images.map((img) => `${img.mimeType ?? "?"}(${(img.data ?? "").length}chars)`).join(", ")
+        : "none";
+      // eslint-disable-next-line no-console
+      console.error(`[rpc→pi] ${cmdType} | msg="${msg?.slice(0, 200) ?? ""}${(msg?.length ?? 0) > 200 ? "..." : ""}" | images=${imgInfo}`);
+    }
+
     this.proc.stdin.write(line);
   }
 
@@ -292,6 +305,111 @@ export class RpcClient extends EventEmitter<RpcClientEvents> {
   /** Get the list of registered extension commands. */
   async getCommands(): Promise<unknown> {
     return this.sendCommandAndWaitResponse({ type: "get_commands" });
+  }
+
+  /** Switch to an existing session by file path. */
+  async switchSession(sessionPath: string): Promise<unknown> {
+    return this.sendCommandAndWaitResponse({
+      type: "switch_session",
+      sessionPath,
+    });
+  }
+
+  /** Get detailed session statistics (tokens, cost, context usage). */
+  async getSessionStats(): Promise<unknown> {
+    return this.sendCommandAndWaitResponse({ type: "get_session_stats" });
+  }
+
+  /** Execute a shell command via Pi's bash tool and wait for the result. */
+  async sendBash(command: string): Promise<unknown> {
+    return this.sendCommandAndWaitResponse({ type: "bash", command });
+  }
+
+  /** Abort a running bash command. */
+  async sendAbortBash(): Promise<unknown> {
+    return this.sendCommandAndWaitResponse({ type: "abort_bash" });
+  }
+
+  /** Get all messages in the current conversation. */
+  async getMessages(): Promise<unknown> {
+    return this.sendCommandAndWaitResponse({ type: "get_messages" });
+  }
+
+  /** Cycle to the next available model. */
+  async cycleModel(): Promise<unknown> {
+    return this.sendCommandAndWaitResponse({ type: "cycle_model" });
+  }
+
+  /** Set the thinking/reasoning level. */
+  async setThinkingLevel(level: string): Promise<unknown> {
+    return this.sendCommandAndWaitResponse({ type: "set_thinking_level", level });
+  }
+
+  /** Cycle through available thinking levels. */
+  async cycleThinkingLevel(): Promise<unknown> {
+    return this.sendCommandAndWaitResponse({ type: "cycle_thinking_level" });
+  }
+
+  /** Set steering message delivery mode. */
+  async setSteeringMode(mode: string): Promise<unknown> {
+    return this.sendCommandAndWaitResponse({ type: "set_steering_mode", mode });
+  }
+
+  /** Set follow-up message delivery mode. */
+  async setFollowUpMode(mode: string): Promise<unknown> {
+    return this.sendCommandAndWaitResponse({ type: "set_follow_up_mode", mode });
+  }
+
+  /** Enable or disable automatic compaction. */
+  async setAutoCompaction(enabled: boolean): Promise<unknown> {
+    return this.sendCommandAndWaitResponse({ type: "set_auto_compaction", enabled });
+  }
+
+  /** Enable or disable automatic retry on transient errors. */
+  async setAutoRetry(enabled: boolean): Promise<unknown> {
+    return this.sendCommandAndWaitResponse({ type: "set_auto_retry", enabled });
+  }
+
+  /** Abort an in-progress retry. */
+  async abortRetry(): Promise<unknown> {
+    return this.sendCommandAndWaitResponse({ type: "abort_retry" });
+  }
+
+  /** Export session to HTML. */
+  async exportHtml(outputPath?: string): Promise<unknown> {
+    const cmd: { type: string; [key: string]: unknown } = { type: "export_html" };
+    if (outputPath) cmd.outputPath = outputPath;
+    return this.sendCommandAndWaitResponse(cmd);
+  }
+
+  /** Fork from a previous user message. */
+  async fork(entryId: string): Promise<unknown> {
+    return this.sendCommandAndWaitResponse({ type: "fork", entryId });
+  }
+
+  /** Clone the current active branch into a new session. */
+  async clone(): Promise<unknown> {
+    return this.sendCommandAndWaitResponse({ type: "clone" });
+  }
+
+  /** Get user messages available for forking. */
+  async getForkMessages(): Promise<unknown> {
+    return this.sendCommandAndWaitResponse({ type: "get_fork_messages" });
+  }
+
+  /** Get the text of the last assistant message. */
+  async getLastAssistantText(): Promise<unknown> {
+    return this.sendCommandAndWaitResponse({ type: "get_last_assistant_text" });
+  }
+
+  /** Set a display name for the current session. */
+  async setSessionName(name: string): Promise<unknown> {
+    return this.sendCommandAndWaitResponse({ type: "set_session_name", name });
+  }
+
+  /** Send a prompt with steer streaming behavior (for forwarding unknown slash commands during streaming). */
+  sendPromptSteer(message: string): void {
+    this.sendCommand({ type: "prompt", message, streamingBehavior: "steer" } as unknown as RpcStdinCommand);
   }
 
   // ── Convenience ──────────────────────────────────────────────────────
